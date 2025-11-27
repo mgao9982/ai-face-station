@@ -1,343 +1,252 @@
 'use client';
 import { useState, useRef } from 'react';
 
-// 结果类型定义
-interface ResultItem {
+// 定义任务结构
+interface TaskItem {
   id: string;
-  src: string;
-  result: string;
-  originalFile: File;
-  loading: boolean;
-  duration: string;
+  file: File;
+  preview: string;
+  taskId?: string;
+  status: 'waiting' | 'submitting' | 'running' | 'success' | 'failed';
+  resultUrl?: string;
+  log: string;
+  startTime?: number;
+  duration?: string;
 }
 
-export default function Home() {
-  const [bodyFiles, setBodyFiles] = useState<File[]>([]);
-  const [faceImg, setFaceImg] = useState<File | null>(null);
-  const [results, setResults] = useState<ResultItem[]>([]);
-  const [isBatchProcessing, setIsBatchProcessing] = useState(false);
-  const [progress, setProgress] = useState('');
-
-  const bodyInputRef = useRef<HTMLInputElement>(null);
+export default function AsyncPage() {
+  const [faceFile, setFaceFile] = useState<File | null>(null);
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
+  
   const faceInputRef = useRef<HTMLInputElement>(null);
+  const bodyInputRef = useRef<HTMLInputElement>(null);
 
-  // 格式化时间
-  const formatDuration = (ms: number) => (ms / 1000).toFixed(2) + 's';
+  const formatDuration = (ms: number) => (ms / 1000).toFixed(1) + 's';
 
-  // 处理上传
+  // 计算全局进度
+  const totalTasks = tasks.length;
+  const completedTasks = tasks.filter(t => t.status === 'success' || t.status === 'failed').length;
+  const progressPercent = totalTasks === 0 ? 0 : (completedTasks / totalTasks) * 100;
+  const isGlobalRunning = tasks.some(t => t.status === 'running' || t.status === 'submitting');
+
+  // 上传身体图
   const handleBodyUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) setBodyFiles(Array.from(e.target.files));
+    if (e.target.files) {
+      const newTasks = Array.from(e.target.files).map(file => ({
+        id: Math.random().toString(36).substr(2, 9),
+        file,
+        preview: URL.createObjectURL(file),
+        status: 'waiting' as const,
+        log: 'READY',
+      }));
+      setTasks(prev => [...prev, ...newTasks]);
+    }
   };
+
+  // 上传脸部图
   const handleFaceUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0]) setFaceImg(e.target.files[0]);
+    if (e.target.files?.[0]) setFaceFile(e.target.files[0]);
   };
 
-  // 批量换脸主逻辑
-  const handleSwap = async () => {
-    if (bodyFiles.length === 0 || !faceImg) return alert('MISSING ASSETS / 请上传图片');
-    
-    setIsBatchProcessing(true);
-    setResults([]); 
-    
-    // 平滑滚动
-    setTimeout(() => window.scrollTo({ top: 800, behavior: 'smooth' }), 100);
+  // 轮询逻辑
+  const pollTask = async (index: number, taskId: string) => {
+    const intervalId = setInterval(async () => {
+      try {
+        const res = await fetch('/api/async/status', {
+          method: 'POST',
+          body: JSON.stringify({ taskId }),
+        });
+        const data = await res.json();
 
-    for (let i = 0; i < bodyFiles.length; i++) {
-      const currentBodyFile = bodyFiles[i];
-      setProgress(`PROCESSING 0${i + 1} / 0${bodyFiles.length}`);
+        setTasks(prev => prev.map((task, i) => {
+          if (i !== index) return task;
+          
+          if (data.status === 'SUCCESS') {
+            clearInterval(intervalId);
+            const timeTaken = task.startTime ? Date.now() - task.startTime : 0;
+            return { ...task, status: 'success', resultUrl: data.output, log: 'DONE', duration: formatDuration(timeTaken) };
+          } else if (data.status === 'FAILED') {
+            clearInterval(intervalId);
+            return { ...task, status: 'failed', log: 'ERR' };
+          } else {
+            return { ...task, status: 'running', log: 'PROCESSING' };
+          }
+        }));
+      } catch (e) { console.error(e); }
+    }, 3000);
+  };
 
-      const startTime = Date.now();
-      const formData = new FormData();
-      formData.append('body_images', currentBodyFile);
-      formData.append('face_image', faceImg);
+  // 批量开始
+  const handleStart = async () => {
+    if (tasks.length === 0 || !faceFile) return alert('MISSING DATA');
+    window.scrollTo({ top: 500, behavior: 'smooth' });
+
+    tasks.forEach(async (task, index) => {
+      if (task.status !== 'waiting') return;
+      const now = Date.now();
+      setTasks(prev => prev.map((t, i) => i === index ? { ...t, status: 'submitting', log: 'INIT...', startTime: now } : t));
 
       try {
-        const res = await fetch('/api/swap', { method: 'POST', body: formData });
+        const formData = new FormData();
+        formData.append('body_image', task.file);
+        formData.append('face_image', faceFile);
+
+        const res = await fetch('/api/async/trigger', { method: 'POST', body: formData });
         const data = await res.json();
-        const endTime = Date.now();
 
-        if (data.error) throw new Error(data.error);
-
-        let newUrl = data.results?.[0] || data.result;
-        if (newUrl) {
-          setResults(prev => [...prev, { 
-            id: Math.random().toString(36).substr(2, 9),
-            src: URL.createObjectURL(currentBodyFile), 
-            result: newUrl,
-            originalFile: currentBodyFile,
-            loading: false,
-            duration: formatDuration(endTime - startTime)
-          }]);
-        }
-      } catch (e) { console.error(e); }
-    }
-    setIsBatchProcessing(false);
-    setProgress('');
+        if (data.taskId) {
+          setTasks(prev => prev.map((t, i) => i === index ? { ...t, taskId: data.taskId, status: 'running', log: 'QUEUED' } : t));
+          pollTask(index, data.taskId);
+        } else { throw new Error('NO ID'); }
+      } catch (e: any) {
+        setTasks(prev => prev.map((t, i) => i === index ? { ...t, status: 'failed', log: 'FAIL' } : t));
+      }
+    });
   };
 
-  // 重绘逻辑
+  // 单张重绘
   const handleRegenerate = async (index: number) => {
-    if (!faceImg) return;
-    setResults(prev => prev.map((item, i) => i === index ? { ...item, loading: true } : item));
-    const targetItem = results[index];
-    const startTime = Date.now();
-    
-    const formData = new FormData();
-    formData.append('body_images', targetItem.originalFile); 
-    formData.append('face_image', faceImg);
+    if (!faceFile) return;
+    const now = Date.now();
+    setTasks(prev => prev.map((t, i) => i === index ? { ...t, status: 'submitting', log: 'RETRY', resultUrl: undefined, startTime: now } : t));
+    const targetTask = tasks[index];
 
     try {
-      const res = await fetch('/api/swap', { method: 'POST', body: formData });
+      const formData = new FormData();
+      formData.append('body_image', targetTask.file);
+      formData.append('face_image', faceFile);
+      const res = await fetch('/api/async/trigger', { method: 'POST', body: formData });
       const data = await res.json();
-      const endTime = Date.now();
-      let newUrl = data.results?.[0] || data.result;
-
-      if (newUrl) {
-        setResults(prev => prev.map((item, i) => 
-          i === index ? { ...item, result: newUrl, loading: false, duration: formatDuration(endTime - startTime) } : item
-        ));
+      if (data.taskId) {
+        setTasks(prev => prev.map((t, i) => i === index ? { ...t, taskId: data.taskId, status: 'running', log: 'QUEUED' } : t));
+        pollTask(index, data.taskId);
       }
-    } catch (e: any) {
-      alert(e.message);
-      setResults(prev => prev.map((item, i) => i === index ? { ...item, loading: false } : item));
-    }
+    } catch (e) { console.error(e); }
   };
 
   return (
-    // 全局背景：使用一张高质量的沙漠/风景图，并叠加模糊层
-    <div className="min-h-screen text-white font-sans selection:bg-white selection:text-black relative overflow-x-hidden">
+    <div className="min-h-screen bg-[#E0E5EC] text-[#2D3436] font-sans selection:bg-black selection:text-white overflow-x-hidden relative">
       
-      {/* 背景层 */}
-      <div 
-        className="fixed inset-0 z-0 bg-cover bg-center bg-no-repeat transform scale-105"
-        style={{ 
-          backgroundImage: 'url("https://images.unsplash.com/photo-1614730341194-75c60740a5d3?q=80&w=3000&auto=format&fit=crop")',
-        }}
-      >
-        {/* 叠加一个暗色遮罩，让文字更清晰 */}
-        <div className="absolute inset-0 bg-black/40 backdrop-blur-xl"></div>
-        {/* 增加一些梦幻的光晕 */}
-        <div className="absolute top-0 left-0 w-full h-full bg-gradient-to-b from-black/20 to-transparent"></div>
+      {/* 背景装饰 */}
+      <div className="fixed top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-white blur-[150px] opacity-60 pointer-events-none"></div>
+      <div className="fixed bottom-[-20%] right-[-10%] w-[60%] h-[60%] rounded-full bg-[#C3CBD6] blur-[150px] opacity-40 pointer-events-none"></div>
+      <div className="fixed inset-0 pointer-events-none z-0 opacity-20">
+         <svg width="100%" height="100%"><path d="M0,100 Q400,200 800,0" fill="none" stroke="black" strokeWidth="1" /><circle cx="80%" cy="20%" r="150" fill="none" stroke="black" strokeWidth="0.5" /></svg>
       </div>
 
-      <main className="relative z-10 max-w-[1400px] mx-auto px-6 py-12 flex flex-col gap-12">
+      <main className="relative z-10 max-w-[1600px] mx-auto px-6 py-12 flex flex-col lg:flex-row items-center justify-center min-h-screen gap-12 lg:gap-24">
         
-        {/* 顶部导航 */}
-        <header className="flex justify-between items-center border-b border-white/10 pb-6">
-          <div className="flex items-center gap-4">
-            <div className="text-3xl font-bold tracking-tighter">O2® <span className="text-xs font-normal opacity-60 ml-2">STUDIO AI</span></div>
+        {/* 左侧：身体图列表 */}
+        <div className="lg:w-1/4 w-full flex flex-col gap-4 order-2 lg:order-1 h-[600px]">
+          <div className="flex justify-between items-end border-b border-black/10 pb-2 mb-4">
+            <h2 className="text-4xl font-light tracking-tighter">BODY<br/>SOURCE</h2>
+            <div className="text-xs font-bold tracking-widest opacity-40 text-right">MULTI<br/>SELECT</div>
           </div>
-          <div className="hidden md:flex gap-8 text-xs tracking-widest opacity-60">
-            <span>THE LATE 2050</span>
-            <span>MOONISH DESIGN</span>
-          </div>
-          <button className="bg-white text-black px-6 py-2 rounded-full text-xs font-bold hover:bg-white/90 transition">
-            PRO VERSION
-          </button>
-        </header>
 
-        {/* 核心操作区 - 模仿参考图的大卡片布局 */}
-        <div className="grid lg:grid-cols-12 gap-6 h-auto lg:h-[600px]">
-          
-          {/* 左侧：01 身体上传区 (模仿 NIKE 卡片) */}
-          <div className="lg:col-span-4 relative group cursor-pointer" onClick={() => bodyInputRef.current?.click()}>
-            <div className="absolute inset-0 bg-white/5 backdrop-blur-md rounded-[40px] border border-white/10 transition-all duration-500 group-hover:bg-white/10 group-hover:border-white/20"></div>
-            
-            {/* 巨大的背景数字 */}
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 text-[180px] font-thin text-white/5 leading-none select-none pointer-events-none font-sans">01</div>
-            
-            <div className="relative h-full p-8 flex flex-col justify-between z-10">
-              <div>
-                <h2 className="text-4xl font-light uppercase tracking-wide">Body<br/>Source</h2>
-                <p className="text-xs opacity-50 mt-4 tracking-wider">UPLOAD TARGET IMAGES / MULTI-SELECT</p>
-              </div>
-
-              {/* 预览展示 */}
-              <div className="flex-1 flex items-center justify-center my-4">
-                {bodyFiles.length === 0 ? (
-                  <div className="w-32 h-32 rounded-full border border-dashed border-white/20 flex items-center justify-center group-hover:scale-110 transition duration-500">
-                    <span className="text-4xl opacity-50 font-thin">+</span>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 gap-2 w-full max-h-[250px] overflow-hidden opacity-80">
-                    {bodyFiles.slice(0, 4).map((f, i) => (
-                      <img key={i} src={URL.createObjectURL(f)} className="w-full h-32 object-cover rounded-xl grayscale group-hover:grayscale-0 transition duration-500" />
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="flex justify-between items-end">
-                <div className="text-xs opacity-40">
-                  {bodyFiles.length > 0 ? `${bodyFiles.length} FILES SELECTED` : 'WAITING FOR INPUT'}
-                </div>
-                <div className="w-10 h-10 rounded-full bg-white text-black flex items-center justify-center">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                </div>
-              </div>
-            </div>
+          <div onClick={() => bodyInputRef.current?.click()} className="h-24 w-full rounded-2xl bg-white/30 backdrop-blur-md border border-white/50 flex items-center justify-between px-6 cursor-pointer hover:bg-white/60 transition duration-500 group shadow-lg shadow-black/5">
+            <span className="text-xs font-bold tracking-widest opacity-60 group-hover:opacity-100">ADD IMAGES</span>
+            <div className="w-8 h-8 rounded-full border border-black/20 flex items-center justify-center group-hover:bg-black group-hover:text-white transition">+</div>
             <input ref={bodyInputRef} type="file" multiple className="hidden" onChange={handleBodyUpload} />
           </div>
 
-          {/* 中间：02 脸部上传区 (模仿 Hoodie 卡片) */}
-          <div className="lg:col-span-5 relative group cursor-pointer" onClick={() => faceInputRef.current?.click()}>
-            <div className="absolute inset-0 bg-gradient-to-b from-white/10 to-black/20 backdrop-blur-xl rounded-[40px] border border-white/20 transition-all duration-500 group-hover:border-white/40"></div>
-            
-             {/* 巨大的背景数字 */}
-             <div className="absolute top-4 right-8 text-[180px] font-thin text-white/5 leading-none select-none pointer-events-none">02</div>
-
-            <div className="relative h-full p-8 flex flex-col z-10">
-              <div className="flex justify-between items-start">
-                <div>
-                   <h2 className="text-4xl font-light uppercase tracking-wide">Face<br/>Reference</h2>
-                   <p className="text-xs opacity-50 mt-4 tracking-wider">UPLOAD SOURCE FACE</p>
-                </div>
-                {/* 装饰性UI元素 */}
-                <div className="flex items-center gap-2">
-                   <div className="h-1 w-12 bg-white/20 rounded-full"></div>
-                </div>
-              </div>
-
-              {/* 脸部预览 (模仿悬浮球效果) */}
-              <div className="flex-1 flex items-center justify-center relative my-6">
-                {/* 模拟光晕背景 */}
-                <div className="absolute w-64 h-64 bg-white/5 rounded-full blur-3xl group-hover:bg-white/10 transition duration-700"></div>
+          <div className="space-y-3 max-h-full overflow-y-auto pr-2 custom-scrollbar flex-1">
+            {tasks.map((task) => (
+              <div key={task.id} className="relative flex items-center gap-4 p-3 rounded-xl bg-white/40 backdrop-blur-sm border border-white/40 overflow-hidden">
+                {/* ✨ 单体进度条背景 - 只有在运行时显示 */}
+                {task.status === 'running' && (
+                   <div className="absolute bottom-0 left-0 h-[2px] bg-black/80 animate-progress w-full"></div>
+                )}
                 
-                <div className="relative w-56 h-56 rounded-full border border-white/10 flex items-center justify-center overflow-hidden bg-black/20 backdrop-blur-sm group-hover:scale-105 transition duration-500">
-                  {faceImg ? (
-                    <img src={URL.createObjectURL(faceImg)} className="w-full h-full object-cover" />
-                  ) : (
-                    <span className="text-xs tracking-widest opacity-40">DRAG & DROP</span>
-                  )}
-                  
-                  {/* 悬浮标签 */}
-                  {faceImg && (
-                    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-black/50 backdrop-blur-md px-4 py-1 rounded-full border border-white/10 text-[10px] tracking-widest uppercase">
-                      Target
-                    </div>
-                  )}
+                <img src={task.preview} className="w-12 h-12 rounded-lg object-cover grayscale opacity-80" />
+                <div className="flex-1 min-w-0 z-10">
+                  <div className="text-[10px] font-mono opacity-50 truncate">{task.file.name}</div>
+                  <div className="flex justify-between items-center mt-1">
+                    <span className={`text-[9px] font-bold tracking-widest px-2 py-0.5 rounded ${
+                      task.status === 'success' ? 'bg-green-200 text-green-800' : 
+                      task.status === 'running' ? 'bg-black text-white' : 'bg-white/50'
+                    }`}>
+                      {task.log}
+                    </span>
+                  </div>
                 </div>
               </div>
-
-              <div className="text-center">
-                 <div className="inline-block px-4 py-2 rounded-full border border-white/10 bg-white/5 text-xs tracking-widest">
-                    {faceImg ? faceImg.name.toUpperCase() : 'NO FILE SELECTED'}
-                 </div>
-              </div>
-            </div>
-            <input ref={faceInputRef} type="file" className="hidden" onChange={handleFaceUpload} />
-          </div>
-
-          {/* 右侧：控制台 */}
-          <div className="lg:col-span-3 flex flex-col gap-6">
-            
-            {/* 开始按钮卡片 */}
-            <div className="flex-1 relative rounded-[40px] overflow-hidden p-1">
-              <div className="absolute inset-0 bg-white/5 backdrop-blur-md border border-white/10 rounded-[40px]"></div>
-              
-              <button 
-                onClick={handleSwap}
-                disabled={isBatchProcessing}
-                className={`relative w-full h-full rounded-[36px] flex flex-col items-center justify-center gap-4 transition-all duration-500 group
-                  ${isBatchProcessing ? 'bg-black/40 cursor-not-allowed' : 'bg-white hover:bg-gray-200 text-black'}`}
-              >
-                 {isBatchProcessing ? (
-                   <>
-                    <div className="w-8 h-8 border-2 border-white/20 border-t-white rounded-full animate-spin"></div>
-                    <span className="text-xs tracking-widest text-white">PROCESSING...</span>
-                   </>
-                 ) : (
-                   <>
-                    <div className="w-12 h-12 rounded-full bg-black text-white flex items-center justify-center group-hover:scale-110 transition">
-                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                    </div>
-                    <div className="text-center">
-                      <div className="text-xl font-bold tracking-tighter">GENERATE</div>
-                      <div className="text-[10px] opacity-60 tracking-widest mt-1">BATCH PROCESS ({bodyFiles.length})</div>
-                    </div>
-                   </>
-                 )}
-              </button>
-            </div>
-
-            {/* 状态信息 */}
-            <div className="h-24 relative rounded-[30px] bg-black/40 backdrop-blur-md border border-white/5 flex items-center justify-center px-6">
-               <div className="w-full">
-                 <div className="flex justify-between text-[10px] opacity-40 mb-2 uppercase tracking-widest">
-                   <span>System Status</span>
-                   <span>Online</span>
-                 </div>
-                 {progress ? (
-                   <div className="text-xs text-white tracking-wider animate-pulse">{progress}</div>
-                 ) : (
-                   <div className="w-full h-1 bg-white/10 rounded-full overflow-hidden">
-                     <div className="w-full h-full bg-white/20 origin-left scale-x-0 transition-transform"></div>
-                   </div>
-                 )}
-               </div>
-            </div>
-
+            ))}
           </div>
         </div>
 
-        {/* 结果展示区 - 横向瀑布流 */}
-        {results.length > 0 && (
-          <div className="mt-12 animate-fade-in">
-             <div className="flex items-center gap-4 mb-8 opacity-80">
-               <div className="w-2 h-8 bg-white"></div>
-               <h2 className="text-3xl font-light uppercase tracking-wider">Output <span className="opacity-40">Gallery</span></h2>
-             </div>
+        {/* 中间：胶囊核心 */}
+        <div className="lg:w-1/3 w-full flex flex-col items-center order-1 lg:order-2 relative">
+          <div className="relative w-[320px] h-[520px] rounded-[160px] bg-white/10 backdrop-blur-2xl border border-white/40 shadow-2xl shadow-black/10 flex flex-col items-center justify-between p-4 overflow-hidden">
+            <div className="absolute top-0 left-0 right-0 h-1/2 bg-gradient-to-b from-white/40 to-transparent pointer-events-none"></div>
 
-             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-               {results.map((item, index) => (
-                 <div key={item.id} className="group relative aspect-[4/5] rounded-[30px] overflow-hidden bg-black/20 border border-white/10 backdrop-blur-sm">
-                    {/* 结果图 */}
-                    <img 
-                      src={item.result} 
-                      className={`w-full h-full object-cover transition duration-700 group-hover:scale-105 ${item.loading ? 'blur-lg opacity-50' : ''}`} 
-                    />
-                    
-                    {/* 悬浮信息层 */}
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition duration-300 flex flex-col justify-end p-6">
-                       <div className="flex justify-between items-end">
-                         <div>
-                            <div className="text-[10px] tracking-widest opacity-60 uppercase mb-1">Generated in</div>
-                            <div className="text-xl font-bold font-mono">{item.duration}</div>
-                         </div>
-                         <div className="flex gap-2">
-                            {/* 重绘按钮 */}
-                            <button 
-                              onClick={() => handleRegenerate(index)}
-                              disabled={item.loading}
-                              className="w-10 h-10 rounded-full bg-white/10 backdrop-blur-md border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition"
-                            >
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                            </button>
-                            {/* 下载按钮 */}
-                            <a 
-                              href={item.result} 
-                              download
-                              className="w-10 h-10 rounded-full bg-white text-black flex items-center justify-center hover:scale-110 transition"
-                            >
-                               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                            </a>
-                         </div>
-                       </div>
+            <div onClick={() => faceInputRef.current?.click()} className="relative mt-6 w-[260px] h-[260px] rounded-full bg-black/5 border border-white/20 overflow-hidden cursor-pointer transition duration-700 group hover:scale-105">
+              {faceFile ? <img src={URL.createObjectURL(faceFile)} className="w-full h-full object-cover" /> : <div className="w-full h-full flex flex-col items-center justify-center text-black/30"><span className="text-4xl font-thin mb-2">+</span><span className="text-[10px] tracking-widest uppercase">Face Ref</span></div>}
+              <input ref={faceInputRef} type="file" className="hidden" onChange={handleFaceUpload} />
+            </div>
+
+            <div className="text-center z-10 mt-4 w-full px-8">
+              <div className="text-[10px] tracking-[0.3em] opacity-50 mb-2">NEURAL LINK</div>
+              <h1 className="text-5xl font-light tracking-tighter text-black mix-blend-overlay">LUNAR</h1>
+              
+              {/* ✨ 全局进度条显示区域 */}
+              <div className="mt-6 w-full">
+                {isGlobalRunning ? (
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-[9px] font-bold tracking-widest opacity-60">
+                      <span>PROCESSING</span>
+                      <span>{completedTasks} / {totalTasks}</span>
                     </div>
+                    <div className="h-1 w-full bg-black/10 rounded-full overflow-hidden">
+                      <div 
+                        className="h-full bg-black transition-all duration-500 ease-out"
+                        style={{ width: `${progressPercent}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-[8px] opacity-40 leading-tight">THE MOON HAS ARISE <br/> OUR WORLD DIDNT COLLIDE</div>
+                )}
+              </div>
+            </div>
 
-                    {/* Loading 状态 */}
-                    {item.loading && (
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin"></div>
-                      </div>
-                    )}
-                 </div>
-               ))}
-             </div>
+            <button onClick={handleStart} disabled={isGlobalRunning} className={`mb-8 text-white w-[200px] h-12 rounded-full flex items-center justify-center gap-2 shadow-lg transition duration-300 z-20 ${isGlobalRunning ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#2D3436] hover:scale-105'}`}>
+              <span className="text-xs font-bold tracking-widest">{isGlobalRunning ? 'BUSY' : 'GENERATE'}</span>
+            </button>
           </div>
-        )}
+        </div>
+
+        {/* 右侧：结果画廊 */}
+        <div className="lg:w-1/3 w-full h-[600px] order-3 relative">
+           <div className="absolute -top-10 right-0 text-[120px] font-thin text-black/5 leading-none pointer-events-none">02</div>
+           <h2 className="text-2xl font-light tracking-tight mb-6 border-l-2 border-black pl-4">OUTPUT<br/>GALLERY</h2>
+           
+           <div className="grid grid-cols-2 gap-4 h-full overflow-y-auto pb-20 content-start custom-scrollbar">
+              {tasks.filter(t => t.resultUrl).map((task, index) => (
+                <div key={task.id} className="relative aspect-[3/4] bg-white p-2 rounded-2xl shadow-md group transition hover:-translate-y-1">
+                   <div className="w-full h-full rounded-xl overflow-hidden relative bg-black/5">
+                      <img src={task.resultUrl} className="w-full h-full object-cover" />
+                      <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition duration-300 flex flex-col items-center justify-center gap-3 backdrop-blur-sm">
+                         {task.duration && <div className="text-white text-xs font-mono border border-white/30 px-2 py-1 rounded-full">{task.duration}</div>}
+                         <div className="flex gap-2">
+                            <button onClick={() => handleRegenerate(tasks.indexOf(task))} className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center hover:scale-110 transition">↺</button>
+                            <a href={task.resultUrl} target="_blank" download className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center hover:scale-110 transition">↓</a>
+                         </div>
+                      </div>
+                   </div>
+                </div>
+              ))}
+              {tasks.filter(t => t.resultUrl).length === 0 && <div className="col-span-2 h-64 border border-dashed border-black/10 rounded-3xl flex items-center justify-center text-xs tracking-widest opacity-40">WAITING FOR OUTPUT...</div>}
+           </div>
+        </div>
 
       </main>
+      <style jsx global>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 4px; }
+        @keyframes progress { 0% { width: 0%; } 100% { width: 100%; } }
+        .animate-progress { animation: progress 2s infinite cubic-bezier(0.4, 0, 0.2, 1); }
+      `}</style>
     </div>
   );
 }
