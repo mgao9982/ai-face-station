@@ -23,7 +23,9 @@ export default function ProPage() {
   
   const faceInputRef = useRef<HTMLInputElement>(null);
   const bodyInputRef = useRef<HTMLInputElement>(null);
-  const intervalRefs = useRef<{ [key: number]: NodeJS.Timeout }>({});
+
+  // ⚡️ 升级：使用 Task ID 作为 Key，而不是数字索引
+  const intervalRefs = useRef<{ [key: string]: NodeJS.Timeout }>({});
 
   const formatDuration = (ms: number) => (ms / 1000).toFixed(1) + 's';
 
@@ -58,20 +60,46 @@ export default function ProPage() {
     return await res.json();
   };
 
-  const handleStop = async (index: number) => {
-    const task = tasks[index];
-    if (intervalRefs.current[index]) {
-      clearInterval(intervalRefs.current[index]);
-      delete intervalRefs.current[index];
+  // 🛑 停止任务 (按 ID)
+  const handleStop = async (id: string) => {
+    const task = tasks.find(t => t.id === id);
+    if (!task) return;
+
+    if (intervalRefs.current[id]) {
+      clearInterval(intervalRefs.current[id]);
+      delete intervalRefs.current[id];
     }
-    setTasks(prev => prev.map((t, i) => 
-      i === index ? { ...t, status: 'cancelled', log: '已终止 / STOPPED' } : t
+
+    setTasks(prev => prev.map(t => 
+      t.id === id ? { ...t, status: 'cancelled', log: '已终止 / STOPPED' } : t
     ));
+
     if (task.taskId) {
       try {
-        fetch('/api/cancel', { method: 'POST', body: JSON.stringify({ taskId: task.taskId }) });
+        fetch('/api/cancel', {
+          method: 'POST',
+          body: JSON.stringify({ taskId: task.taskId })
+        });
       } catch (e) { console.error(e); }
     }
+  };
+
+  // 🗑️ 删除任务 (新增功能)
+  const handleRemoveTask = (id: string) => {
+    // 1. 如果正在运行，先停止
+    if (intervalRefs.current[id]) {
+        clearInterval(intervalRefs.current[id]);
+        delete intervalRefs.current[id];
+    }
+    // 2. 从列表移除
+    setTasks(prev => prev.filter(t => t.id !== id));
+  };
+
+  // 🗑️ 删除脸部图 (新增功能)
+  const handleRemoveFace = (e: React.MouseEvent) => {
+    e.stopPropagation(); // 防止触发上传点击
+    setFaceFile(null);
+    if (faceInputRef.current) faceInputRef.current.value = ''; // 清空 input，允许重复选同一张
   };
 
   const handleBodyUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -91,78 +119,91 @@ export default function ProPage() {
     if (e.target.files?.[0]) setFaceFile(e.target.files[0]);
   };
 
-  const pollTask = async (index: number, taskId: string) => {
-    if (intervalRefs.current[index]) clearInterval(intervalRefs.current[index]);
+  // 轮询 (升级为按 ID 更新)
+  const pollTask = async (id: string, taskId: string) => {
+    if (intervalRefs.current[id]) clearInterval(intervalRefs.current[id]);
 
     const intervalId = setInterval(async () => {
       try {
         const res = await fetch('/api/async/status', { method: 'POST', body: JSON.stringify({ taskId }) });
         const data = await res.json();
 
-        setTasks(prev => prev.map((task, i) => {
-          if (i !== index) return task;
+        setTasks(prev => prev.map(task => {
+          if (task.id !== id) return task;
+          
           if (task.status === 'cancelled') {
             clearInterval(intervalId);
             return task;
           }
+
           if (data.status === 'SUCCESS') {
             clearInterval(intervalId);
-            delete intervalRefs.current[index];
+            delete intervalRefs.current[id];
             const timeTaken = task.startTime ? Date.now() - task.startTime : 0;
             return { ...task, status: 'success', resultUrl: data.output, log: '完成 / DONE', duration: formatDuration(timeTaken) };
           } else if (data.status === 'FAILED') {
             clearInterval(intervalId);
-            delete intervalRefs.current[index];
+            delete intervalRefs.current[id];
             return { ...task, status: 'failed', log: `ERR: ${data.msg || 'Fail'}` };
           }
           return { ...task, status: 'running', log: '处理中 / PROCESSING' };
         }));
       } catch (e) { console.error(e); }
     }, 3000);
-    intervalRefs.current[index] = intervalId;
+
+    intervalRefs.current[id] = intervalId;
   };
 
   const handleStart = async () => {
-    if (tasks.length === 0 || !faceFile) return alert('请先上传图片！');
+    if (tasks.length === 0 || !faceFile) return alert('请先上传图片！\nPlease upload images first.');
     window.scrollTo({ top: 500, behavior: 'smooth' });
     
     const now = Date.now();
     setTasks(prev => prev.map(t => t.status === 'waiting' ? { ...t, status: 'uploading', log: '准备中 / PREPARING', startTime: now } : t));
 
     let faceUrl = '';
-    try { faceUrl = await uploadToBlob(faceFile); } catch (e) { return alert('脸部图上传失败'); }
+    try {
+        faceUrl = await uploadToBlob(faceFile);
+    } catch (e) { return alert('脸部图上传失败'); }
 
-    tasks.forEach(async (task, index) => {
+    tasks.forEach(async (task) => { // 这里不再需要 index
       if (task.status !== 'waiting' && task.log !== '准备中 / PREPARING') return;
+
       try {
-        setTasks(prev => prev.map((t, i) => i === index ? { ...t, log: '上传中 / UPLOADING' } : t));
-        if (intervalRefs.current[index]) { /* ... */ }
+        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, log: '上传中 / UPLOADING' } : t));
         const bodyUrl = await uploadToBlob(task.file);
-        setTasks(prev => prev.map((t, i) => i === index ? { ...t, status: 'submitting', log: '启动中 / INITIATING' } : t));
+
+        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, status: 'submitting', log: '启动中 / INITIATING' } : t));
         const data = await triggerTask(bodyUrl, faceUrl);
+
         if (data.taskId) {
-          setTasks(prev => prev.map((t, i) => i === index ? { ...t, taskId: data.taskId, status: 'running', log: '排队中 / QUEUED' } : t));
-          pollTask(index, data.taskId);
+          setTasks(prev => prev.map(t => t.id === task.id ? { ...t, taskId: data.taskId, status: 'running', log: '排队中 / QUEUED' } : t));
+          pollTask(task.id, data.taskId); // 传入 ID
         } else { throw new Error('NO ID'); }
       } catch (e: any) {
-        setTasks(prev => prev.map((t, i) => i === index ? { ...t, status: 'failed', log: '失败 / FAIL' } : t));
+        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, status: 'failed', log: '失败 / FAIL' } : t));
       }
     });
   };
 
-  const handleRegenerate = async (index: number) => {
+  const handleRegenerate = async (id: string) => { // 传入 ID
     if (!faceFile) return alert('脸部图丢失');
-    if (intervalRefs.current[index]) clearInterval(intervalRefs.current[index]);
+    
+    if (intervalRefs.current[id]) clearInterval(intervalRefs.current[id]);
+
     const now = Date.now();
-    setTasks(prev => prev.map((t, i) => i === index ? { ...t, status: 'uploading', log: '重试中 / RETRYING', resultUrl: undefined, startTime: now } : t));
-    const targetTask = tasks[index];
+    setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'uploading', log: '重试中 / RETRYING', resultUrl: undefined, startTime: now } : t));
+    
+    const targetTask = tasks.find(t => t.id === id);
+    if (!targetTask) return;
+
     try {
       const bodyUrl = await uploadToBlob(targetTask.file);
       const faceUrl = await uploadToBlob(faceFile);
       const data = await triggerTask(bodyUrl, faceUrl);
       if (data.taskId) {
-        setTasks(prev => prev.map((t, i) => i === index ? { ...t, taskId: data.taskId, status: 'running', log: '排队中 / QUEUED' } : t));
-        pollTask(index, data.taskId);
+        setTasks(prev => prev.map(t => t.id === id ? { ...t, taskId: data.taskId, status: 'running', log: '排队中 / QUEUED' } : t));
+        pollTask(id, data.taskId);
       }
     } catch (e) { console.error(e); }
   };
@@ -189,13 +230,11 @@ export default function ProPage() {
   return (
     <div className="min-h-screen bg-[#E0E5EC] text-[#2D3436] font-sans selection:bg-black selection:text-white overflow-x-hidden relative">
       
-      {/* 顶部标记 */}
       <div className="fixed top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 z-50"></div>
       <div className="fixed top-4 right-4 z-50">
-          <span className="bg-black text-white text-[10px] font-bold px-3 py-1 rounded-full tracking-widest shadow-lg">PRO / ASYNC</span>
+          <span className="bg-black text-white text-[10px] font-bold px-3 py-1 rounded-full tracking-widest">PRO / 异步版</span>
       </div>
 
-      {/* 背景 */}
       <div className="fixed top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-white blur-[150px] opacity-60 pointer-events-none"></div>
       <div className="fixed bottom-[-20%] right-[-10%] w-[60%] h-[60%] rounded-full bg-[#C3CBD6] blur-[150px] opacity-40 pointer-events-none"></div>
 
@@ -223,9 +262,8 @@ export default function ProPage() {
           </div>
 
           <div className="space-y-3 max-h-full overflow-y-auto pr-2 custom-scrollbar flex-1 pt-2">
-            {tasks.map((task, index) => (
+            {tasks.map((task) => (
               <div key={task.id} className="relative flex items-center gap-4 p-3 rounded-xl bg-white/40 backdrop-blur-sm border border-white/40 overflow-hidden group hover:bg-white/60 transition">
-                {/* 进度条 */}
                 {(task.status === 'running' || task.status === 'uploading' || task.status === 'submitting') && (
                    <div className="absolute bottom-0 left-0 h-[2px] bg-black/80 animate-progress w-full"></div>
                 )}
@@ -245,20 +283,31 @@ export default function ProPage() {
                   </div>
                 </div>
                 
-                {/* 🟥 停止按钮 */}
-                {(task.status === 'running' || task.status === 'submitting' || task.status === 'uploading') && (
-                    <button 
-                        onClick={(e) => { 
-                            e.preventDefault();
-                            e.stopPropagation(); 
-                            handleStop(index); 
-                        }}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 w-8 h-8 bg-white/80 hover:bg-red-500 hover:text-white text-red-500 rounded-full flex items-center justify-center transition opacity-0 group-hover:opacity-100 shadow-sm z-50 backdrop-blur-sm"
-                        title="终止生成 / STOP"
-                    >
-                        <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
-                    </button>
-                )}
+                {/* 操作区：停止或删除 */}
+                <div className="absolute right-3 top-1/2 -translate-y-1/2 flex gap-2 opacity-0 group-hover:opacity-100 transition z-50">
+                    {/* 停止按钮 */}
+                    {(task.status === 'running' || task.status === 'submitting' || task.status === 'uploading') && (
+                        <button 
+                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleStop(task.id); }}
+                            className="w-8 h-8 bg-white/80 hover:bg-red-500 hover:text-white text-red-500 rounded-full flex items-center justify-center shadow-sm backdrop-blur-sm"
+                            title="终止生成"
+                        >
+                            <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
+                        </button>
+                    )}
+                    
+                    {/* 🗑️ 删除按钮 (新增) */}
+                    {/* 只有不在运行中，或者已取消时才显示删除，防止逻辑冲突 */}
+                    {(task.status === 'waiting' || task.status === 'success' || task.status === 'failed' || task.status === 'cancelled') && (
+                        <button 
+                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleRemoveTask(task.id); }}
+                            className="w-8 h-8 bg-white/80 hover:bg-red-600 hover:text-white text-gray-400 rounded-full flex items-center justify-center shadow-sm backdrop-blur-sm"
+                            title="移除任务"
+                        >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                        </button>
+                    )}
+                </div>
               </div>
             ))}
           </div>
@@ -266,13 +315,26 @@ export default function ProPage() {
 
         {/* 中间：胶囊核心 */}
         <div className="lg:w-1/3 w-full flex flex-col items-center order-1 lg:order-2 relative">
-          <div className="relative w-[340px] h-[560px] rounded-[170px] bg-white/10 backdrop-blur-2xl border border-white/40 shadow-2xl shadow-black/10 flex flex-col items-center justify-between p-6 overflow-hidden transition hover:shadow-black/20 duration-700">
+          <div className="relative w-[320px] h-[520px] rounded-[160px] bg-white/10 backdrop-blur-2xl border border-white/40 shadow-2xl shadow-black/10 flex flex-col items-center justify-between p-4 overflow-hidden group">
             <div className="absolute top-0 left-0 right-0 h-1/2 bg-gradient-to-b from-white/40 to-transparent pointer-events-none"></div>
 
-            <div onClick={() => faceInputRef.current?.click()} className="relative mt-4 w-[280px] h-[280px] rounded-full bg-black/5 border border-white/30 overflow-hidden cursor-pointer transition duration-700 group hover:scale-105 shadow-inner">
-              {faceFile ? <img src={URL.createObjectURL(faceFile)} className="w-full h-full object-cover" /> : (
-                <div className="w-full h-full flex flex-col items-center justify-center text-black/20 group-hover:text-black/40 transition">
-                    <span className="text-5xl font-thin mb-2">+</span>
+            {/* 脸部图区域 (带删除按钮) */}
+            <div onClick={() => faceInputRef.current?.click()} className="relative mt-6 w-[260px] h-[260px] rounded-full bg-black/5 border border-white/20 overflow-hidden cursor-pointer transition duration-700 hover:scale-105">
+              {faceFile ? (
+                <>
+                    <img src={URL.createObjectURL(faceFile)} className="w-full h-full object-cover" />
+                    {/* 🗑️ 脸部图删除按钮 */}
+                    <button 
+                        onClick={handleRemoveFace}
+                        className="absolute top-4 right-4 w-8 h-8 bg-black/50 hover:bg-red-500 text-white rounded-full flex items-center justify-center transition z-50"
+                        title="移除脸部图"
+                    >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </>
+              ) : (
+                <div className="w-full h-full flex flex-col items-center justify-center text-black/30">
+                    <span className="text-4xl font-thin mb-2">+</span>
                     <span className="text-xs font-bold tracking-widest">上传脸部</span>
                     <span className="text-[8px] opacity-60 mt-1 tracking-[0.2em]">UPLOAD FACE</span>
                 </div>
@@ -280,13 +342,13 @@ export default function ProPage() {
               <input ref={faceInputRef} type="file" className="hidden" onChange={handleFaceUpload} />
             </div>
 
-            <div className="text-center z-10 w-full px-4">
-              <div className="text-[10px] tracking-[0.4em] opacity-40 mb-2 font-bold">FACE REFERENCE</div>
-              <h1 className="text-4xl font-light tracking-tighter text-black mix-blend-overlay">头部参考</h1>
+            <div className="text-center z-10 mt-4 w-full px-8">
+              <div className="text-[10px] tracking-[0.3em] opacity-50 mb-2 font-bold">FACE REFERENCE</div>
+              <h1 className="text-3xl font-light tracking-tighter text-black mix-blend-overlay mt-1">脸部参考</h1>
               
-              <div className="mt-6 w-full min-h-[40px]">
+              <div className="mt-6 w-full">
                 {isGlobalRunning ? (
-                  <div className="space-y-3 animate-fade-in">
+                  <div className="space-y-2 animate-fade-in">
                     <div className="flex justify-between text-[9px] font-bold tracking-widest opacity-60 px-2">
                       <span>处理进度 / PROCESSING</span>
                       <span>{completedTasks} / {totalTasks}</span>
@@ -303,10 +365,10 @@ export default function ProPage() {
               </div>
             </div>
 
-            <button onClick={handleStart} disabled={isGlobalRunning} className={`mb-6 text-white w-[220px] h-14 rounded-full flex items-center justify-center gap-2 shadow-xl transition duration-300 z-20 ${isGlobalRunning ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#1A1A1A] hover:scale-105 hover:bg-black'}`}>
+            <button onClick={handleStart} disabled={isGlobalRunning} className={`mb-8 text-white w-[200px] h-12 rounded-full flex items-center justify-center gap-2 shadow-lg transition duration-300 z-20 ${isGlobalRunning ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#2D3436] hover:scale-105'}`}>
               <div className="flex flex-col items-center leading-none">
-                  <span className="text-sm font-bold tracking-[0.2em] mb-1">{isGlobalRunning ? '处理中...' : '开始生成'}</span>
-                  <span className="text-[8px] opacity-50 tracking-widest">{isGlobalRunning ? 'BUSY' : 'GENERATE'}</span>
+                  <span className="text-xs font-bold tracking-widest">{isGlobalRunning ? '处理中...' : '开始生成'}</span>
+                  <span className="text-[8px] opacity-60 tracking-widest">{isGlobalRunning ? 'BUSY' : 'GENERATE'}</span>
               </div>
             </button>
           </div>
@@ -333,19 +395,15 @@ export default function ProPage() {
            </div>
            
            <div className="grid grid-cols-2 gap-4 h-full overflow-y-auto pb-20 content-start custom-scrollbar">
-              {tasks.filter(t => t.resultUrl).map((task, index) => (
-                <div key={task.id} className="relative aspect-[3/4] bg-white p-2 rounded-2xl shadow-md group transition hover:-translate-y-1 hover:shadow-xl">
+              {tasks.filter(t => t.resultUrl).map((task) => (
+                <div key={task.id} className="relative aspect-[3/4] bg-white p-2 rounded-2xl shadow-md group transition hover:-translate-y-1">
                    <div className="w-full h-full rounded-xl overflow-hidden relative bg-black/5">
                       <img src={task.resultUrl} className="w-full h-full object-cover" />
-                      <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition duration-300 flex flex-col items-center justify-center gap-3 backdrop-blur-sm">
-                         {task.duration && (
-                           <div className="text-white text-[10px] font-mono border border-white/30 px-3 py-1 rounded-full bg-black/20 backdrop-blur-md">
-                             {task.duration}
-                           </div>
-                         )}
+                      <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition duration-300 flex flex-col items-center justify-center gap-3 backdrop-blur-sm">
+                         {task.duration && <div className="text-white text-xs font-mono border border-white/30 px-2 py-1 rounded-full">{task.duration}</div>}
                          <div className="flex gap-2">
-                            <button onClick={() => handleRegenerate(tasks.indexOf(task))} className="w-9 h-9 rounded-full bg-white text-black flex items-center justify-center hover:scale-110 transition shadow-lg" title="重绘">↺</button>
-                            <a href={task.resultUrl} target="_blank" download className="w-9 h-9 rounded-full bg-white text-black flex items-center justify-center hover:scale-110 transition shadow-lg" title="下载">↓</a>
+                            <button onClick={() => handleRegenerate(task.id)} className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center hover:scale-110 transition" title="重绘">↺</button>
+                            <a href={task.resultUrl} target="_blank" download className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center hover:scale-110 transition" title="下载">↓</a>
                          </div>
                       </div>
                    </div>
