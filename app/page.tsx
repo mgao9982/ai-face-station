@@ -308,7 +308,7 @@ export default function Home() {
                 <div className="flex items-center z-20">
                     {(task.status === 'running' || task.status === 'submitting' || task.status === 'uploading') ? (
                         <button 
-                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleStop(index); }}
+                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleStop(task.id); }}
                             className="w-8 h-8 bg-red-100 text-red-500 rounded-full flex items-center justify-center shadow-sm active:scale-95"
                         >
                             <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6z" /></svg>
