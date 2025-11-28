@@ -357,7 +357,7 @@ export default function Home() {
                       <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black/80 to-transparent flex justify-between items-end">
                          {task.duration && <div className="text-white/80 text-[9px] font-mono mb-1">{task.duration}</div>}
                          <div className="flex gap-2">
-                            <button onClick={() => handleRegenerate(tasks.indexOf(task))} className="w-8 h-8 rounded-full bg-white/20 backdrop-blur-md text-white flex items-center justify-center active:bg-white active:text-black transition border border-white/20">↺</button>
+                            <button onClick={() => handleRegenerate(tasks.indexOf(task.id))} className="w-8 h-8 rounded-full bg-white/20 backdrop-blur-md text-white flex items-center justify-center active:bg-white active:text-black transition border border-white/20">↺</button>
                             <a href={task.resultUrl} target="_blank" download className="w-8 h-8 rounded-full bg-white/20 backdrop-blur-md text-white flex items-center justify-center active:bg-white active:text-black transition border border-white/20">↓</a>
                          </div>
                       </div>
